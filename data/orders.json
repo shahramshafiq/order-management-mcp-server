@@ -3,8 +3,8 @@
     {
       "id": "ORD-f0855d9b",
       "order_number": "ORD-20260929-E2CC",
-      "customer_name": "Shahram Shafiq",
-      "customer_email": "shahramshafiqgoraya4363@gmail.com",
+      "customer_name": "Sample Customer",
+      "customer_email": "customer@example.com",
       "items": [
         {
           "product_id": "PROD-58b768f1",
