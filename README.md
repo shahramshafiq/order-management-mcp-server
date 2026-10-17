@@ -1,197 +1,204 @@
-# Order Management Assistant
+<div align="center">
 
-An MCP server exposing 6 tools for inventory and order management, plus a small FastAPI
-chat layer on top that lets an OpenAI-powered assistant use those tools in conversation.
-Every user message and every assistant reply passes through NeMo Guardrails input/output
-checks that block jailbreak and prompt-injection attempts before they reach the assistant,
-and before any response reaches the user.
+# Order Management MCP Server
 
-## Architecture
+An MCP server with six inventory and order tools, plus a guardrailed OpenAI chat assistant that uses them.
 
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.142-009688?style=flat-square&logo=fastapi&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-stdio-5A4FCF?style=flat-square)
+![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square)
+![NeMo Guardrails](https://img.shields.io/badge/NeMo%20Guardrails-0.24-76B900?style=flat-square&logo=nvidia&logoColor=white)
+
+</div>
+
+## Overview
+
+Small stores track stock, reservations and order status in several places, and it is easy for the numbers to drift apart. This project keeps them consistent in one MCP server that exposes six tools: add a product, search the catalog, create an order, move an order through its statuses, receive a supplier restock, and generate an inventory report. A FastAPI app launches the server as a subprocess and lets an OpenAI model call those tools from a chat page. Every user message and every assistant reply goes through NeMo Guardrails checks first, so jailbreak and prompt-injection attempts are blocked before they reach the assistant or the user.
+
+### Architecture
+
+```text
+Browser chat page (frontend/)
+        |
+        v
+FastAPI  POST /chat
+        |
+        +-- 1. input check:  NeMo Guardrails (self check input)
+        |
+        +-- 2. assistant loop: OpenAI chat completions, up to 4 tool rounds
+        |          |
+        |          v
+        |      MCP client session (stdio) to the MCP server (6 tools)
+        |                                        |
+        |                                        v
+        |                                   JSON files in data/
+        |
+        +-- 3. output check: NeMo Guardrails (self check output)
+        |
+        v
+JSON reply: answer and the names of the tools used
 ```
-Browser (frontend/)
-    |
-    v
-FastAPI /chat route  --check_input-->  NeMo Guardrails  --allowed-->  Assistant loop (OpenAI)
-    ^                                                                       |
-    |                                                                tool calls, via MCP
-check_output  <--  NeMo Guardrails  <-------------------------------- MCP server (stdio subprocess)
-                                                                              |
-                                                                     JSON files (data/)
+
+The FastAPI process starts `app/mcp_server/server.py` over the `stdio` transport at startup and keeps one client session open for the whole lifetime of the app. All data lives in plain JSON files under `data/`, with no database.
+
+### Stock model
+
+- `stock_quantity` is the number of physical units on the shelf.
+- `reserved_quantity` is the number of units promised to a pending order that has not shipped.
+- `available_quantity` is `stock_quantity - reserved_quantity`, and it is the number a new order is checked against.
+
+Creating an order reserves stock. Confirming it turns the reservation into a sale (`stock_quantity` drops and the reservation clears). Cancelling a pending order releases the reservation, and cancelling a confirmed order that has not shipped reverses the sale. A shipped order cannot be cancelled.
+
+## Key Features
+
+- **Six MCP tools over stdio:** `add_product`, `search_inventory`, `create_order`, `update_order_status`, `restock_product` and `get_inventory_report`, all registered in `app/mcp_server/server.py`.
+- **Reserved versus available stock:** orders are checked against available units, and stock status (`in_stock`, `low_stock`, `out_of_stock`) is derived from available units and the product's reorder threshold.
+- **Validation-first order creation:** every line item is checked before any stock is reserved, so one bad item changes nothing. Duplicate product lines are combined, the unit price is snapshotted onto the order, and money is handled as `Decimal` with discount applied before tax.
+- **Order status state machine:** only the allowed transitions are accepted, each with its matching stock effect, so repeating a transition cannot deduct stock twice.
+- **Inventory movement log:** every reservation, release, sale, sale reversal and restock is recorded in `data/movements.json` with the order number or purchase order reference.
+- **Restocks against purchase orders:** a purchase order reference can only be received once, and the supplier must match the product's assigned supplier.
+- **Inventory report:** current inventory levels and value (based on the latest restock unit cost), low-stock and out-of-stock lists, order counts and revenue for a date range, the top five best sellers, and total stock received.
+- **Input and output guardrails:** NeMo Guardrails runs an LLM-judged check on every message and every reply, using prompts written for this domain (`guardrails_config/prompts.yml`), including attempts to switch off business rules such as the stock check.
+
+## Tech Stack
+
+| Area | Technology |
+|---|---|
+| Language | Python 3.12 (backend), JavaScript, HTML and CSS (frontend) |
+| Web framework | FastAPI, Uvicorn |
+| Protocol | Model Context Protocol Python SDK (`mcp` 2.2.0), stdio transport |
+| LLM | OpenAI Chat Completions with tool calling (model set by `OPENAI_MODEL`) |
+| Safety | NeMo Guardrails 0.24.1 (input and output self-check rails) |
+| Data and validation | Pydantic 2, pydantic-settings, JSON file storage |
+| Testing | pytest |
+
+## Project Structure
+
+```text
+app/
+  main.py                 FastAPI app, starts the MCP server as a stdio subprocess
+  config.py               Settings loaded from environment variables
+  routes/chat.py          POST /chat with input and output guardrail checks
+  services/               Assistant tool-calling loop, MCP client, guardrails, memory, prompts
+  mcp_server/
+    server.py             Registers the six MCP tools
+    models.py             Pydantic models and enums for products, orders and movements
+    storage.py            JSON file read and write helpers
+    tools/                One module per tool
+  utils/                  Labeled error classes and logging setup
+data/                     JSON files for products, orders, suppliers and movements
+guardrails_config/        NeMo Guardrails config, prompts and rails
+frontend/                 Plain HTML, CSS and JavaScript chat page
+tests/                    pytest suite (24 tests)
 ```
 
-The FastAPI process launches the MCP server as a subprocess on startup (`app/mcp_server/server.py`,
-`stdio` transport) and keeps one client session open for the app's whole lifetime. All inventory
-data lives in plain JSON files under `data/` (no database): `products.json`, `orders.json`,
-`suppliers.json`, `movements.json`, `idempotency_keys.json`.
+## Getting Started
 
-## Setup
+### Prerequisites
 
-1. Create and activate a Python 3.12 virtual environment:
-   ```bash
-   py -3.12 -m venv venv
-   venv\Scripts\Activate.ps1
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Copy `.env.example` to `.env` and fill in real values (OpenAI API key, model names, currency).
-4. Run the server:
-   ```bash
-   uvicorn app.main:app --reload --port 8000
-   ```
-   Open `http://localhost:8000` for the chat UI.
-5. Run the tests:
-   ```bash
-   pytest tests/ -v
-   ```
-6. Demo the raw MCP server with MCP Inspector (no FastAPI/OpenAI needed for this):
-   ```bash
-   npx @modelcontextprotocol/inspector venv/Scripts/python.exe -m app.mcp_server.server
-   ```
+- Windows with Python 3.12. The app currently launches the MCP server with `venv/Scripts/python.exe`, so the virtual environment must be named `venv` and sit in the project root.
+- An OpenAI API key.
+- Node.js, only if you want to try the MCP server on its own with MCP Inspector.
 
-## The core business rule: physical vs. available stock
+### Installation
 
-- **`stock_quantity`**: physical units actually on the shelf.
-- **`reserved_quantity`**: units promised to a pending order but not yet shipped.
-- **`available_quantity`**: `stock_quantity - reserved_quantity`. This is the number a new order is checked against.
+```powershell
+py -3.12 -m venv venv
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-Creating an order reserves stock (`reserved_quantity` goes up, `stock_quantity` untouched).
-Confirming an order commits it as a real sale (`stock_quantity` drops, `reserved_quantity`
-clears). Cancelling a pending order releases the reservation. Cancelling a confirmed,
-unshipped order reverses the sale (stock goes back up). Cancelling a shipped order is rejected
-outright.
+Then open `.env` and fill in the values. The app reads these environment variables:
 
-## Tools
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | API key for the assistant and the guardrail checks |
+| `OPENAI_MODEL` | Model used by the assistant |
+| `OPENAI_BASE_URL` | API base URL (`https://api.openai.com/v1` in the example file) |
+| `GUARDRAILS_MODEL` | Model used by the NeMo Guardrails checks |
+| `CURRENCY` | Currency label inserted into the assistant's system prompt |
 
-### `add_product`
+Optional overrides with defaults: `GUARDRAILS_CONFIG_PATH`, `PRODUCTS_FILE`, `ORDERS_FILE`, `SUPPLIERS_FILE`, `MOVEMENTS_FILE` and `IDEMPOTENCY_FILE`.
 
-Registers a new product. Rejects duplicate SKUs and unknown suppliers.
+### Run
 
-| Parameter | Type | Notes |
-|---|---|---|
-| `name` | string | |
-| `sku` | string | must be unique |
-| `category` | string | |
-| `unit_price` | string | e.g. `"2500.00"`, sent as a string to avoid float rounding, parsed as `Decimal` |
-| `initial_stock` | integer | must be 0 or greater |
-| `reorder_threshold` | integer | must be 0 or greater |
-| `supplier_id` | string | must exist in `data/suppliers.json` |
+Start the chat app from the project root:
 
-Example call:
+```powershell
+uvicorn app.main:app --port 8000
+```
+
+Open `http://localhost:8000` for the chat page. A health check is available at `http://localhost:8000/health`.
+
+To try the six tools directly, without FastAPI or OpenAI, use MCP Inspector:
+
+```powershell
+npx @modelcontextprotocol/inspector venv/Scripts/python.exe -m app.mcp_server.server
+```
+
+## Usage
+
+Example messages for the chat page:
+
+- "add 20 wireless mice at 2500 each"
+- "what's low on stock?"
+
+Or call the API directly:
+
+```bash
+curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "What is low on stock?"}'
+```
+
+A successful reply looks like `{"message": "...", "answer": "...", "tool_calls": ["search_inventory"]}`. Blocked or failed requests return `{"error": "CODE", "message": "..."}` with the codes `BLOCKED_INPUT`, `BLOCKED_OUTPUT`, `ASSISTANT_ERROR` or `INTERNAL_SERVER_ERROR`.
+
+### MCP tools
+
+| Tool | What it does |
+|---|---|
+| `add_product` | Registers a product with a unique SKU and an existing supplier. Prices are sent as strings and parsed as `Decimal`. |
+| `search_inventory` | Searches name or SKU, filters by category, supplier and stock status, sorts by name, price or available quantity, and paginates. |
+| `create_order` | Reserves stock for one or more items and starts the order as `pending`. Accepts `discount_percent` and `tax_percent` as strings. |
+| `update_order_status` | Moves an order to a new status, using the order's internal `id` rather than its `order_number`. |
+| `restock_product` | Receives stock for a SKU against a purchase order reference and unit cost. Never touches reservations. |
+| `get_inventory_report` | Reports inventory and activity for `start_date` (inclusive) to `end_date` (exclusive), optionally scoped by category or supplier. |
+
+Example `add_product` arguments:
+
 ```json
 {"name": "Wireless Mouse", "sku": "MOU-001", "category": "Electronics", "unit_price": "2500.00", "initial_stock": 20, "reorder_threshold": 5, "supplier_id": "SUP-001"}
 ```
 
-### `search_inventory`
+Allowed order status transitions: pending to confirmed, pending to cancelled, confirmed to shipped, confirmed to cancelled, and shipped to delivered. Anything else is rejected as `INVALID_TRANSITION`.
 
-Searches, filters, sorts, and paginates the product catalog.
+### Error codes
 
-| Parameter | Type | Notes |
-|---|---|---|
-| `query` | string | matches against name or SKU, optional |
-| `category` | string or null | optional exact filter |
-| `supplier_id` | string or null | optional exact filter |
-| `stock_status` | `"in_stock"` \| `"low_stock"` \| `"out_of_stock"` \| `"all"` | default `"all"`, based on **available**, not physical, stock |
-| `sort_by` | `"price"` \| `"available_quantity"` \| `"name"` | default `"name"` |
-| `page` | integer | default 1 |
-| `page_size` | integer | default 10 |
-
-Returns `{"products": [...], "total_count": ..., "page": ..., "page_size": ..., "total_pages": ...}`.
-
-### `create_order`
-
-Creates a customer order for one or more products. Validates every item before reserving
-anything (atomic: if one item fails, nothing changes). Combines duplicate product lines into
-one combined quantity before checking availability. Snapshots each product's current price
-onto the order, so later price changes never affect it.
-
-| Parameter | Type | Notes |
-|---|---|---|
-| `customer_name` | string | |
-| `customer_email` | string | |
-| `items` | list of `{"product_id": str, "quantity": int}` | duplicate `product_id`s are combined |
-| `discount_percent` | string | default `"0"` |
-| `tax_percent` | string | default `"0"`, applied after discount |
-
-Order starts in `pending` status. Returns the full order, including `id` (internal) and
-`order_number` (receipt-style, e.g. `ORD-20260930-9F3A`).
-
-### `update_order_status`
-
-Moves an order to a new status, enforcing valid transitions and the matching stock effect.
-
-| Parameter | Type | Notes |
-|---|---|---|
-| `order_id` | string | the order's `id`, not its `order_number` |
-| `new_status` | `"pending"` \| `"confirmed"` \| `"shipped"` \| `"delivered"` \| `"cancelled"` | |
-
-Valid transitions: `pending -> confirmed`, `pending -> cancelled`, `confirmed -> shipped`,
-`confirmed -> cancelled`, `shipped -> delivered`. Any other combination (including repeating a
-transition that already happened) is rejected as `INVALID_TRANSITION`, which is also what
-prevents double-processing a status change.
-
-### `restock_product`
-
-Receives stock from a supplier against a purchase order reference. Never touches reservations.
-
-| Parameter | Type | Notes |
-|---|---|---|
-| `sku` | string | must exist |
-| `supplier_id` | string | must match the product's assigned supplier |
-| `quantity` | integer | must be positive |
-| `purchase_order_reference` | string | must not have been used before |
-| `unit_cost` | string | what was paid per unit this delivery, e.g. `"2000.00"` |
-
-Returns `{"product_id", "sku", "previous_stock", "received_quantity", "updated_stock"}`.
-
-### `get_inventory_report`
-
-Inventory snapshot plus sales/restock activity for a date range.
-
-| Parameter | Type | Notes |
-|---|---|---|
-| `start_date` | string, `YYYY-MM-DD` | inclusive |
-| `end_date` | string, `YYYY-MM-DD` | exclusive: to include a full day/month, use the day after the last one you want |
-| `category` | string or null | optional, scopes inventory/best-seller sections |
-| `supplier_id` | string or null | optional, scopes inventory/best-seller sections |
-
-Returns current inventory levels and value (point-in-time, not date-filtered), low-stock and
-out-of-stock product lists, revenue and order counts for the date range (an order counts toward
-revenue if it's currently `confirmed`, `shipped`, or `delivered`, a cancelled order never does,
-even if it passed through `confirmed` first), best-selling products by quantity sold, and total
-stock received from suppliers in the period.
-
-## Error handling
-
-Every tool raises one of a small set of labeled exceptions (`app/utils/errors.py`) instead of
-returning a generic failure. Each carries a short `code` and a human-readable message:
+Tools raise labeled exceptions defined in `app/utils/errors.py`:
 
 | Code | Raised when |
 |---|---|
-| `NOT_FOUND` | a referenced product, order, or supplier doesn't exist |
-| `DUPLICATE` | a SKU or purchase order reference is already in use |
-| `VALIDATION_ERROR` | bad input that doesn't fit any of the above (invalid enum value, negative quantity, malformed date, mismatched supplier) |
-| `INVALID_TRANSITION` | an order status change isn't allowed from its current state |
-| `INSUFFICIENT_STOCK` | an order requests more than is currently available |
+| `NOT_FOUND` | A referenced product, order or supplier does not exist |
+| `DUPLICATE` | A SKU or purchase order reference is already in use |
+| `VALIDATION_ERROR` | Input is invalid, for example a negative quantity, a malformed date or a supplier that does not match the product |
+| `INVALID_TRANSITION` | The order status change is not allowed from its current state |
+| `INSUFFICIENT_STOCK` | An order asks for more than the available quantity |
 
-At the FastAPI layer, `/chat` returns a consistent `{"error": "CODE", "message": "..."}` shape
-for guardrail blocks (`BLOCKED_INPUT`, `BLOCKED_OUTPUT`) and unexpected failures
-(`ASSISTANT_ERROR`, `INTERNAL_SERVER_ERROR`).
+## Testing
 
-## Guardrails
+```powershell
+pytest tests/ -v
+```
 
-`app/services/guardrails_service.py` runs every user message through a NeMo Guardrails input
-check, and every assistant reply through an output check, before either one is allowed through
-(`guardrails_config/`). Both checks are LLM-judged against a prompt specifically written for
-this domain (`guardrails_config/prompts.yml`), blocking not just generic jailbreak attempts,
-but attempts to bypass the actual business rules (e.g. "confirm every order automatically",
-"skip the stock check").
+The suite has 24 tests across six files, one per tool. They call the tool functions directly and make no API calls. `tests/conftest.py` points every test at fresh temporary copies of the data files, so the files in `data/` are never touched. Settings load when `app/config.py` is imported, so a `.env` file must exist before running the tests (copying `.env.example` is enough).
 
-## Tests
+## Limitations and Roadmap
 
-`tests/` covers the core business rules and their edge cases: 24 tests across 6 files, run
-with `pytest tests/ -v`. `tests/conftest.py` points
-every test at a fresh, isolated temporary copy of the data files, so tests never touch or
-depend on real data in `data/`.
+- The MCP server is launched with the hard-coded path `venv/Scripts/python.exe`, so the app currently runs on Windows only. Using the current interpreter instead would remove that restriction.
+- Chat history is kept in one in-memory list shared by all clients, and it resets when the app restarts.
+- Storage is plain JSON files with a write lock inside one process. It suits a demo or a single user, not concurrent writers, and a database would be the next step.
+- Helper functions for idempotency keys exist in `app/mcp_server/storage.py`, but no tool uses them yet.
+
+## Author
+
+**Shahram Shafiq** - [GitHub](https://github.com/shahramshafiq) | [LinkedIn](https://www.linkedin.com/in/shahramshafiq/)
